@@ -1,6 +1,6 @@
 --- #YAML:1.0
 name:               OSDial
-version:            2.2.9.083
+version:            3.0.2.124
 abstract:           Perl module for interfacing with the OSDial. 
 author:
     - Lott Caskey <lottcaskey@gmail.com>

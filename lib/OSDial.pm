@@ -1,7 +1,7 @@
 #
 # OSDial.pm
 #
-## Copyright (C) 2009  Lott Caskey  <lottcaskey@gmail.com>    LICENSE: AGPLv3
+## Copyright (C) 2010-2011  Lott Caskey  <lottcaskey@gmail.com>    LICENSE: AGPLv3
 ##
 ##     This file is part of OSDial.
 ##
@@ -28,8 +28,12 @@ use warnings;
 use DBI;
 use Asterisk::AGI;
 use Digest::MD5 qw(md5_hex); 
+use Email::Stuffer;
+use Email::Sender::Transport::SMTP;
+use Proc::Exists ('pexists');
+use Data::Dumper;
 
-our $VERSION = '2.2.9.083';
+our $VERSION = '3.0.2.124';
 
 my %vars;
 
@@ -105,30 +109,16 @@ sub new {
 
 	$self->debug(1,'new',"Initializing OSDial module, debug-level is %s.",$self->{DB});
 	
-	# Load osdial.conf settings.
-        $self->_load_config();
-
-	$self->sql_max_packet();
-
-	# Load system settings.
-        $self->{settings} = $self->sql_query("SELECT * FROM system_settings LIMIT 1;");
-	foreach my $st (keys %{$self->{settings}}) {
-		$self->debug(4,'new','    %-30s => %-30s.',$st,$self->{settings}{$st});	
-	}
-
-	# Load this servers settings.
-        $self->{server} = $self->sql_query(sprintf("SELECT * FROM servers WHERE server_ip='%s' LIMIT 1;", $self->{VARserver_ip}));
-	foreach my $st (keys %{$self->{server}}) {
-		$self->debug(4,'new','    %-30s => %-30s.',$st,$self->{server}{$st});	
-	}
-
-	# Parse in settings from configuration table.
-        while (my $sret = $self->sql_query(sprintf("SELECT name,data FROM configuration WHERE fk_id='';"))) {
-		$self->{configuration}{$sret->{name}} = $sret->{data};
-		$self->debug(4,'new','    %-30s => %-30s.',$sret->{name},$sret->{data});	
-	}
+	# Load osdial.conf and database settings.
+        $self->load_config();
 
         return $self;
+}
+
+sub clone {
+	my $self = shift;
+	my $copy = bless { %$self }, ref $self;
+	return $copy;
 }
 
 =head2 B<Contructor Arguments and Defaults>
@@ -136,7 +126,7 @@ sub new {
    DB                               => '0'
    
    PATHconf                         => '/etc/osdial.conf'
-   PATHdocs                         => '/usr/share/doc/osdial-2.2.9.083'
+   PATHdocs                         => '/usr/share/doc/osdial-3.0.2.124'
    PATHhome                         => '/opt/osdial/bin'
    PATHlogs                         => '/var/log/osdial'
    PATHagi                          => '/var/lib/asterisk/agi-bin'
@@ -196,7 +186,7 @@ sub _set_defaults {
         	'DB'                   => 0,
 
         	'PATHconf'             => '/etc/osdial.conf',
-		'PATHdocs'             => '/usr/share/doc/osdial-2.2.9.083',
+		'PATHdocs'             => '/usr/share/doc/osdial-3.0.2.124',
 		'PATHhome'             => '/opt/osdial/bin',
 		'PATHlogs'             => '/var/log/osdial',
 		'PATHagi'              => '/var/lib/asterisk/agi-bin',
@@ -218,6 +208,7 @@ sub _set_defaults {
         	'VARDB_user'           => 'osdial',
         	'VARDB_pass'           => 'osdial1234',
         	'VARDB_port'           => '3306',
+        	'VARDB_onfail'         => 'die',
 
 		'VARfastagi_log_min_servers'       => '3',
 		'VARfastagi_log_max_servers'       => '16',
@@ -265,21 +256,61 @@ sub _set_defaults {
 	);
 }
 
-sub _load_config {
+=item B<load_config()> - load configuration.
+
+Loads in the configuration from /etc/osdial.conf, global and server specific
+database settings.
+
+   # Read /etc/osdial.conf setting.
+   $osdial->{VARserver_ip}
+
+   # Read setting from system_settings table.
+   $osdial->{settings}{company_name}
+
+   # Read setting for this specific server.
+   $osdial->{server}{server_id}
+
+   # Read a setting in from the configuration table.
+   $osdial->{configuration}{ArchiveHost}
+
+=cut
+
+sub load_config {
 	my $self = shift;
         if (-e $self->{PATHconf}) {
-		$self->debug(4,'_load_config',"Loading configuration file (%s).",$self->{PATHconf});
+		$self->debug(4,'load_config',"Loading configuration file (%s).",$self->{PATHconf});
         	open(CONF, $self->{PATHconf}) or die 'OSDial: Error opening ' . $self->{PATHconf} . "\n";
         	while (my $line = <CONF>) {
         	        $line =~ s/ |>|"|'|\n|\r|\t|\#.*|;.*//gi;
         	        if ($line =~ /=|:/) {
-        	                my($key,$val) = split /=|:/, $line;
+        	                my($key,$val) = split /=|:/, $line, 2;
         	                $self->{$key} = $val;
-				$self->debug(4,'_load_config',"    %-40s => %-40s.",$key,$val);
+				$self->debug(4,'load_config',"    %-40s => %-40s.",$key,$val);
         	        }
         	}
+
+		$self->sql_max_packet();
+
+		# Load system settings.
+        	$self->{settings} = $self->sql_query("SELECT * FROM system_settings LIMIT 1;");
+		foreach my $st (keys %{$self->{settings}}) {
+			$self->debug(4,'new','    %-30s => %-30s.',$st,$self->{settings}{$st});	
+		}
+
+		# Load this servers settings.
+        	$self->{server} = $self->sql_query(sprintf("SELECT * FROM servers WHERE server_ip='%s' LIMIT 1;", $self->{VARserver_ip}));
+		foreach my $st (keys %{$self->{server}}) {
+			$self->debug(4,'new','    %-30s => %-30s.',$st,$self->{server}{$st});	
+		}
+
+		# Parse in settings from configuration table.
+        	while (my $sret = $self->sql_query(sprintf("SELECT name,data FROM configuration WHERE fk_id='';"))) {
+			$self->{configuration}{$sret->{name}} = $sret->{data};
+			$self->debug(4,'new','    %-30s => %-30s.',$sret->{name},$sret->{data});	
+		}
+
 	} else {
-		$self->debug(0,'_load_config',"Configuration file (%s) does not exist.",$self->{PATHconf});
+		$self->debug(0,'load_config',"Configuration file (%s) does not exist.",$self->{PATHconf});
 	}
 }
 
@@ -382,16 +413,28 @@ sub agi_tts_sayphrase {
 
 sub tts_osdial_parse {
 	my ($self,$phrase,$data) = @_;
-	$phrase =~ s/(\[\[.*\]\])/|||$1|||/g;
-	my @splits = split('\|\|\|', $phrase);
-	my $c=0;
-	foreach my $var (@splits) {
-		if ($var =~ /\[\[.*\]\]/) {
+	$phrase =~ s/(\[\[[^\s]*\]\])/|||$1|||/g;
+	$phrase =~ s/(\{\{[^\s]*\}\})/|||$1|||/g;
+	my @splits;
+	foreach my $var (split('\|\|\|', $phrase)) {
+		my $tsdata;
+		if ($var =~ /\{\{[^\s]*\}\}/) {
+			my $fld = $var;
+			$fld =~ s/\{\{|\}\}//g;
+			$tsdata = '%'.$fld.'%';
+		} elsif ($var =~ /\[\[[^\s]*\]\]/) {
 			my $fld = $var;
 			$fld =~ s/\[\[|\]\]//g;
-			$splits[$c] = $data->{$fld};
+			if (!defined($data->{$fld})) {
+				$tsdata = 'DATA_MISSING';
+			} else {
+				$tsdata = $data->{$fld};
+			}
+		} else {
+			$tsdata = $var;
 		}
-		$c++;
+		$tsdata =~ s/^\s*$//g;
+		push @splits, $tsdata if ($tsdata ne '');
 	}
 	return @splits;
 }
@@ -399,43 +442,47 @@ sub tts_osdial_parse {
 sub tts_generate {
 	my ($self,$phrase,$voice) = @_;
 	$voice = 'voice_nitech_us_rms_arctic_hts' unless ($voice);
-	my $hash = md5_hex($voice.':'.$phrase);
 	my $cachedir = "/opt/osdial/tts";
 	my $sdir1 = "/mnt/ramdisk/sounds";
 	my $sdir2 = "/var/lib/asterisk/sounds";
-	my $base = 'tts-'.$hash; 
 
-	if (! -f $cachedir.'/'.$base.'.wav') {
-		open(TXT, '>'.$cachedir.'/'.$base.'.txt');
-		print TXT $phrase;
-		close(TXT);
-		my $cmd = '/usr/bin/text2wave '.$cachedir.'/'.$base.'.txt -F 8000 -o '.$cachedir.'/'.$base.'.wav -eval "(' . $voice . ')"';
-		$self->debug(1,'tts_generate','Running %s.',$cmd);
-		system($cmd);
-		unlink($cachedir.'/'.$base.'.txt');
+	if ($phrase =~ /^%.*%$/) {
+		$phrase =~ s/^%(.*)%$/$1/;
+		$phrase =~ s/^osdial\///;
+		return $phrase;
 	} else {
-		$self->debug(1,'tts_generate','%s/%s.wav already exists.',$cachedir,$base);
-	}
-
-	if(-f $cachedir.'/'.$base.'.wav') {
-		if (-d $sdir1) {
-			if (! -d $sdir1.'/tts') {
-				$self->debug(1,'tts_generate','Making directory %s/tts.',$sdir1);
-				mkdir($sdir1.'/tts',oct('0777'));
-			}
-			if (! -f $sdir1.'/tts/'.$base.'.wav') {
-				$self->debug(1,'tts_generate','Copying %s/%s.wav to %s/tts.',$cachedir,$base,$sdir1);
-				system('/bin/cp -au '.$cachedir.'/'.$base.'.wav '.$sdir1.'/tts') unless (-f $sdir1.'/tts/'.$base.'.wav');
-			}
+		my $hash = md5_hex($voice.':'.$phrase);
+		my $base = 'tts-'.$hash; 
+		if (! -f $cachedir.'/'.$base.'.wav') {
+			open(TXT, '>'.$cachedir.'/'.$base.'.txt');
+			print TXT $phrase . "\n";
+			close(TXT);
+			system("/usr/bin/text2wave -eval \"($voice)\" -F 8000 -o $cachedir/$base.wav $cachedir/$base.txt");
+			unlink($cachedir.'/'.$base.'.txt');
+		} else {
+			$self->debug(1,'tts_generate','%s/%s.wav already exists.',$cachedir,$base);
 		}
-		if (-d $sdir2) {
-			if (! -d $sdir2.'/tts') {
-				$self->debug(1,'tts_generate','Making directory %s/tts.',$sdir2);
-				mkdir($sdir2.'/tts',oct('0777'));
+
+		if(-f $cachedir.'/'.$base.'.wav') {
+			if (-d $sdir1 and -w $sdir1) {
+				if (! -d $sdir1.'/tts') {
+					$self->debug(1,'tts_generate','Making directory %s/tts.',$sdir1);
+					mkdir($sdir1.'/tts',oct('0777'));
+				}
+				if (! -f $sdir1.'/tts/'.$base.'.wav') {
+					$self->debug(1,'tts_generate','Copying %s/%s.wav to %s/tts.',$cachedir,$base,$sdir1);
+					system('/bin/cp -au '.$cachedir.'/'.$base.'.wav '.$sdir1.'/tts') unless (-f $sdir1.'/tts/'.$base.'.wav');
+				}
 			}
-			if (! -f $sdir2.'/tts/'.$base.'.wav') {
-				$self->debug(1,'tts_generate','Copying %s/%s.wav to %s/tts.',$cachedir,$base,$sdir2);
-				system('/bin/cp -au '.$cachedir.'/'.$base.'.wav '.$sdir2.'/tts') unless (-f $sdir2.'/tts/'.$base.'.wav');
+			if (-d $sdir2 and -w $sdir2) {
+				if (! -d $sdir2.'/tts') {
+					$self->debug(1,'tts_generate','Making directory %s/tts.',$sdir2);
+					mkdir($sdir2.'/tts',oct('0777'));
+				}
+				if (! -f $sdir2.'/tts/'.$base.'.wav') {
+					$self->debug(1,'tts_generate','Copying %s/%s.wav to %s/tts.',$cachedir,$base,$sdir2);
+					system('/bin/cp -au '.$cachedir.'/'.$base.'.wav '.$sdir2.'/tts') unless (-f $sdir2.'/tts/'.$base.'.wav');
+				}
 			}
 		}
 		return 'tts/'.$base;
@@ -496,10 +543,23 @@ sub sql_connect {
 	if ($self->{_sql}{$dbh}{connected}<1) {
 		my $dsn = 'DBI:mysql:' . $dbname . ':' . $dbsrvr . ':' . $dbport;
 		$self->debug(5,'sql_connect',"Connecting to dbh %s at DSN: %s.",$dbh,$dsn);
-		$self->{_sql}{$dbh}{dbh} = DBI->connect($dsn,$dbuser,$dbpass) or die '  -- OSDial: sql_connect:  ERROR ' . $self->{_sql}{$dbh}{dbh}->errstr;
-		$self->{_sql}{$dbh}{dbh}{PrintError} = 0;
-		$self->{_sql}{$dbh}{connected} = 1;
+		$self->{_sql}{$dbh}{dbh} = DBI->connect($dsn,$dbuser,$dbpass);
+		my $myerr = DBI::errstr;
+		if ($myerr) {
+			$self->{_sql}{$dbh}{dbh}{mysql_auto_reconnect} = 0;
+			$self->{_sql}{$dbh}{connected} = 0;
+			if ($dbh eq 'A') {
+				$self->sql_onfail('  -- OSDial: sql_connect:  ERROR ' . $myerr);
+			} else {
+				warn '  -- OSDial: sql_connect:  ERROR ' . $myerr;
+			}
+		} else {
+			$self->{_sql}{$dbh}{dbh}{PrintError} = 0;
+			$self->{_sql}{$dbh}{dbh}{mysql_auto_reconnect} = 1;
+			$self->{_sql}{$dbh}{connected} = 1;
+		}
 	}
+	return $self->{_sql}{$dbh}{connected};
 }
 
 
@@ -637,8 +697,8 @@ sub sql_query {
 	# If connected to DB and sth has not been defined, issue query.
 	if (defined $self->{_sql}{$dbh}{dbh} and !defined $self->{_sql}{$dbh}{sth}) {
 		$self->debug(5,'sql_query',"DBH %-6s  [execute]  STMT:  %s",$dbh, $stmt);
-        	$self->{_sql}{$dbh}{sth} = $self->{_sql}{$dbh}{dbh}->prepare($stmt) or die "  -- OSDial: sql_query $dbh:  ERROR " . $self->{_sql}{$dbh}{dbh}->errstr;
-        	$self->{_sql}{$dbh}{sth}->execute or die "  -- OSDial: sql_query $dbh:  ERROR " . $self->{_sql}{$dbh}{dbh}->errstr;
+        	$self->{_sql}{$dbh}{sth} = $self->{_sql}{$dbh}{dbh}->prepare($stmt) or $self->sql_onfail("  -- OSDial: sql_query $dbh:  ERROR " . $self->{_sql}{$dbh}{dbh}->errstr);
+        	$self->{_sql}{$dbh}{sth}->execute or $self->sql_onfail("  -- OSDial: sql_query $dbh:  ERROR " . $self->{_sql}{$dbh}{dbh}->errstr);
 		$self->{_sql}{$dbh}{rows} = 0;
 		$self->{_sql}{$dbh}{last_stmt} = $stmt;
 		delete $self->{_sql}{$dbh}{row};
@@ -730,7 +790,7 @@ sub sql_execute {
 	return $self->sql_query($opts) if ($stmt =~ /^select|^show/i);
 
 	$self->debug(5,'sql_query',"DBH %-6s  [execute]  STMT:  %s",$dbh, $stmt);
-	$self->{_sql}{$dbh}{rows} = $self->{_sql}{$dbh}{dbh}->do($stmt) or die "  -- OSDial: sql_execute $dbh:  ERROR " . $self->{_sql}{$dbh}{dbh}->errstr;
+	$self->{_sql}{$dbh}{rows} = $self->{_sql}{$dbh}{dbh}->do($stmt) or $self->sql_onfail("  -- OSDial: sql_execute $dbh:  ERROR " . $self->{_sql}{$dbh}{dbh}->errstr);
 	return $self->{_sql}{$dbh}{rows};
 }
 
@@ -760,8 +820,72 @@ sub sql_quote {
 	return $self->{_sql}{$dbh}{dbh}->quote($string);
 }
 sub quote { return sql_quote(@_); }
-sub mres { return sql_quote(@_); }
+sub mres {
+	my $dequote = sql_quote(@_);
+	$dequote =~ s/^'|'$//g;
+	return $dequote;
+}
 
+
+sub sql_onfail {
+        my ($self,$string) = @_;
+	if ($self->{VARDB_onfail} eq 'warn') {
+		warn $string;
+	} else {
+		die $string;
+	}
+}
+
+
+=over 4
+
+=item B<sql_dbh( $dbh )> - returns the dbh handle.
+
+Returns the maximum allowed packet size that the SQL server will except.
+
+   $dbhandle = $osdial->sql_dbh($dbh);
+
+=back
+
+=cut
+
+sub sql_dbh {
+	my ($self, $dbh) = @_;
+	$dbh = 'A' unless ($dbh);
+	# If dbh has not been defined, connect to DB.
+	$self->sql_connect($dbh) if (!defined $self->{_sql}{$dbh} or $self->{_sql}{$dbh}{connected}<1);
+	return $self->{_sql}{$dbh}{dbh};
+}
+
+
+=over 4
+
+=item B<sql_last_insert_id( $dbh )> - returns the last insert id.
+=item B<sql_last_insertid( $dbh )> - returns the last insert id.
+=item B<sql_last_id( $dbh )> - returns the last insert id.
+=item B<sql_insert_id( $dbh )> - returns the last insert id.
+
+Returns the last insert ID.
+
+   $insertid = $osdial->sql_last_insert_id($dbh);
+   $insertid = $osdial->sql_last_insertid($dbh);
+   $insertid = $osdial->sql_last_id($dbh);
+   $insertid = $osdial->sql_insert_id($dbh);
+
+=back
+
+=cut
+
+sub sql_last_insert_id {
+	my ($self, $dbh) = @_;
+	$dbh = 'A' unless ($dbh);
+	# If dbh has not been defined, connect to DB.
+	$self->sql_connect($dbh) if (!defined $self->{_sql}{$dbh} or $self->{_sql}{$dbh}{connected}<1);
+	return $self->sql_dbh($dbh)->{'mysql_insertid'};
+}
+sub sql_last_insertid { return sql_last_insert_id(@_); }
+sub sql_last_id { return sql_last_insert_id(@_); }
+sub sql_insert_id { return sql_last_insert_id(@_); }
 
 
 =over 4
@@ -907,6 +1031,7 @@ sub media_add_files {
 
 	$self->debug(3,'media_add_files',"Adding Directory:%s  Pattern:%s  Update:%s",$dir,$pattern, $updatedata);
 	my @files;
+	return @files if (!-d $dir );
 	opendir(MAFDIR,$dir);
 	foreach my $filename (readdir(MAFDIR)) {
 		if ($filename ne '.' and $filename ne '..' and $filename =~ /$pattern/ and not -d $filename) {
@@ -1003,7 +1128,7 @@ sub media_add_file {
 
 
 	my $data="";
-	my $max_packet = $self->sql_max_packet() - 100_000;
+	my $max_packet = $self->sql_max_packet() - 120_000;
 	open(MAF, '<'.$file);
 	binmode(MAF);
 	while (read(MAF, $data, $max_packet ) ) {
@@ -1139,6 +1264,174 @@ sub media_save_files {
 
 
 
+=over 4
+
+=item B<send_email( $host, $port, $user, $pass, $to, $from, $subject, $html, $text )>
+=item B<send_email({ host=>$host, port=>$port, user=>$user, pass=>$pass, to=>$to, from=>$from, subject=>$subject, $html=>$html, text=>$text })>
+
+Sends out an email using the given parameters. Returns 1 on success, 0 on failure.
+
+=back
+
+=cut
+
+sub send_email {
+	my ($self, $opt1, $port, $user, $pass, $to, $from, $subject, $html, $text) = @_;
+
+	my $host='';
+
+	if (ref($opt1) =~ /HASH/) {
+		$host = $opt1->{'host'} if (exists($opt1->{'host'}));
+		$port = $opt1->{'port'} if (exists($opt1->{'port'}));
+		$user = $opt1->{'user'} if (exists($opt1->{'user'}));
+		$pass = $opt1->{'pass'} if (exists($opt1->{'pass'}));
+		$to = $opt1->{'to'} if (exists($opt1->{'to'}));
+		$from = $opt1->{'from'} if (exists($opt1->{'from'}));
+		$subject = $opt1->{'subject'} if (exists($opt1->{'subject'}));
+		if (exists($opt1->{'message'})) {
+			$text=$opt1->{'message'};
+			$html="<pre style=\"font-family:'DejaVu Sans mono','Lucida Console',monospace;\">".$text.'</pre>';
+		} else {
+			$html = $opt1->{'html'} if (exists($opt1->{'html'}));
+			$text = $opt1->{'text'} if (exists($opt1->{'text'}));
+		}
+	} else {
+		$host = $opt1;
+	}
+
+	$host='localhost' if (!defined($host) or $host eq '');
+	$port='25' if (!defined($port) or $port eq '');
+
+	my $transparams = { 'host' => $host, 'port' => $port };
+	if (defined($user) and $user ne '') {
+		$transparams->{'sasl_username'} = $user;
+		$transparams->{'sasl_password'} = $pass;
+	}
+
+	my $transport = Email::Sender::Transport::SMTP->new($transparams);
+
+	my $email = Email::Stuffer->to($to)
+		->from($from)
+		->subject($subject)
+		->text_body($text)
+		->html_body($html)
+		->transport($transport);
+
+	my $eres = $email->send();
+
+	return 1 if (ref($eres) =~ /^Email::Sender::Success/);
+	return 0;
+}
+
+
+
+=over 4
+
+=item B<osdevent({ server_ip=>$server_ip, unqiueid=>$unqiueid, callerid=>$callerid, user=>$user, campaign_id=>$campaign_id, group_id=>$group_id, lead_id=>$lead_id, event=>$event, data1=>$data1, data2=>$data2, data3=>$data3, data4=>$data4, data5=>$data5, data6=>$data6 })>
+
+Records the given data into the osdial_events table.
+
+=back
+
+=cut
+
+sub osdevent {
+        my ($self,$optref) = @_;
+	my $opts = {};
+	if (ref($optref) eq "HASH") {
+		$opts = $optref;
+	}
+	my $oelsql = '';
+	foreach my $opt (sort keys %{$opts}) {
+		$oelsql .= sprintf("%s=%s,",$opt,$self->quote($opts->{$opt}));
+	}
+	chop($oelsql);
+	if (length($oelsql)>0) {
+		$self->sql_execute(sprintf('INSERT INTO osdial_events SET %s;', $oelsql),'OEL');
+		return $self->sql_last_insert_id('OEL');
+	}
+	return 0;
+}
+
+
+
+sub server_process_tracker {
+	my ($self,$prog,$server_ip,$pid,$allow_multiple) = @_;
+	my $pcount=0;
+	my $ret=1;
+	my $procs = {};
+	while (my $sret = $self->sql_query(sprintf("SELECT id,name,server_ip,pid,IF(UNIX_TIMESTAMP(last_checkin)>UNIX_TIMESTAMP()-180 AND pid>0,1,0) AS is_alive FROM server_keepalive_processes WHERE name='%s' ORDER BY last_checkin DESC;",$self->mres($prog)))) {
+		if (!defined($procs->{$prog})) {
+			$procs->{$prog} = { 'id'=>$sret->{id}, 'server_ip' => $sret->{server_ip}, 'pid' => $sret->{pid}, 'is_alive' => $sret->{is_alive} };
+		}
+		$pcount++;
+	}
+	if ($pcount==0) {
+		my $sret = $self->sql_query(sprintf("SELECT id FROM server_keepalive_processes WHERE name='%s' AND server_ip='%s' ORDER BY last_checkin DESC LIMIT 1;",$self->mres($prog),$self->mres($server_ip)));
+		if (defined($sret->{ROW}) and $sret->{ROW} > 0) {
+			$self->sql_execute(sprintf("UPDATE server_keepalive_processes SET server_ip='%s',name='%s',pid='%s',last_checkin=NOW() WHERE id='%s';",$self->mres($server_ip),$self->mres($prog),$self->mres($pid),$self->mres($sret->{id})));
+		} else {
+			$self->sql_execute(sprintf("INSERT INTO server_keepalive_processes SET server_ip='%s',name='%s',pid='%s';",$self->mres($server_ip),$self->mres($prog),$self->mres($pid)));
+		}
+		$ret=0;
+	} else {
+		foreach my $name (keys %{$procs}) {
+			if ($procs->{$name}{is_alive}>0) {
+				if ($procs->{$name}{server_ip} eq $server_ip) {
+					if ($procs->{$name}{pid} eq $pid) {
+						if ($procs->{$name}{pid}>0 and pexists($procs->{$name}{pid})) {
+							$self->sql_execute(sprintf("UPDATE server_keepalive_processes SET server_ip='%s',name='%s',pid='%s',last_checkin=NOW() WHERE id='%s';",$self->mres($server_ip),$self->mres($prog),$self->mres($pid),$self->mres($procs->{$name}{id})));
+						} else {
+							$self->sql_execute(sprintf("UPDATE server_keepalive_processes SET server_ip='%s',name='%s',pid='%s',last_checkin=NOW() WHERE id='%s';",$self->mres($server_ip),$self->mres($prog),$self->mres('0'),$self->mres($procs->{$name}{id})));
+						}
+						$ret=0;
+					} else {
+						if ($procs->{$name}{pid}>0 and pexists($procs->{$name}{pid})) {
+							$self->sql_execute(sprintf("UPDATE server_keepalive_processes SET server_ip='%s',name='%s',pid='%s',last_checkin=NOW() WHERE id='%s';",$self->mres($server_ip),$self->mres($prog),$self->mres($procs->{$name}{pid}),$self->mres($procs->{$name}{id})));
+						} else {
+							$self->sql_execute(sprintf("UPDATE server_keepalive_processes SET server_ip='%s',name='%s',pid='%s',last_checkin=NOW() WHERE id='%s';",$self->mres($server_ip),$self->mres($prog),$self->mres($pid),$self->mres($procs->{$name}{id})));
+						}
+						$ret=0;
+					}
+				} else {
+					if ($allow_multiple>0) {
+						my $sret = $self->sql_query(sprintf("SELECT id FROM server_keepalive_processes WHERE name='%s' AND server_ip='%s' ORDER BY last_checkin DESC LIMIT 1;",$self->mres($prog),$self->mres($server_ip)));
+						if (defined($sret->{ROW}) and $sret->{ROW} > 0) {
+	
+							$self->sql_execute(sprintf("UPDATE server_keepalive_processes SET server_ip='%s',name='%s',pid='%s',last_checkin=NOW() WHERE id='%s';",$self->mres($server_ip),$self->mres($prog),$self->mres($pid),$self->mres($sret->{id})));
+						} else {
+							$self->sql_execute(sprintf("INSERT INTO server_keepalive_processes SET server_ip='%s',name='%s',pid='%s';",$self->mres($server_ip),$self->mres($prog),$self->mres($pid)));
+						}
+						$ret=0;
+					}
+				}
+			} else {
+				if ($procs->{$name}{server_ip} eq $server_ip) {
+					$self->sql_execute(sprintf("UPDATE server_keepalive_processes SET server_ip='%s',name='%s',pid='%s',last_checkin=NOW() WHERE id='%s';",$self->mres($server_ip),$self->mres($prog),$self->mres($pid),$self->mres($procs->{$name}{id})));
+					$ret=0;
+				} else {
+					if ($allow_multiple>0) {
+						my $sret = $self->sql_query(sprintf("SELECT id FROM server_keepalive_processes WHERE name='%s' AND server_ip='%s' ORDER BY last_checkin DESC LIMIT 1;",$self->mres($prog),$self->mres($server_ip)));
+						if (defined($sret->{ROW}) and $sret->{ROW} > 0) {
+							$self->sql_execute(sprintf("UPDATE server_keepalive_processes SET server_ip='%s',name='%s',pid='%s',last_checkin=NOW() WHERE id='%s';",$self->mres($server_ip),$self->mres($prog),$self->mres($pid),$self->mres($sret->{id})));
+						} else {
+							$self->sql_execute(sprintf("INSERT INTO server_keepalive_processes SET server_ip='%s',name='%s',pid='%s';",$self->mres($server_ip),$self->mres($prog),$self->mres($pid)));
+						}
+						$ret=0;
+					} else {
+						$self->sql_execute(sprintf("UPDATE server_keepalive_processes SET server_ip='%s',name='%s',pid='%s',last_checkin=NOW() WHERE id='%s';",$self->mres($server_ip),$self->mres($prog),$self->mres($pid),$self->mres($procs->{$name}{id})));
+						$ret=0;
+					}
+				}
+			}
+		}
+	}
+	return $ret;
+}
+
+
+
+
 
 # Make sure we do a little cleanup before exiting.
 sub DESTROY {
@@ -1155,6 +1448,14 @@ __END__
 
 =head1 SEE ALSO
 
+Official OSDial support is available through Call Center Service Group: L<http://www.callcentersg.com/>
+
+OSDial website: L<http://www.osdial.org/>
+OSDial at SourceForce: L<http://sourceforge.net/projects/osdial/>
+
+RPMs available through the Fugitol RPM Repository: L<http://rpm.fugitol.com/>
+
+
 The definitive AGI Module: L<Asterisk::AGI>  Website: L<http://asterisk.gnuinter.net/>
 
 DBI Module: L<DBI>  Website: L<http://dbi.perl.org/>
@@ -1168,7 +1469,7 @@ Lott Caskey, <lottcaskey@gmail.com>
 
 =head1 COPYRIGHT
 
-Copyright (c) 2009-2010  Lott Caskey <lottcaskey@gmail.com>
+Copyright (c) 2010-2011  Lott Caskey <lottcaskey@gmail.com>
 
 =head1 LICENSE
 
